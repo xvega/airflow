@@ -1248,15 +1248,17 @@ class DagRun(Base, LoggingMixin):
             tags=self.stats_tags,
         ):
             dag = self.get_dag()
-            info = self.task_instance_scheduling_decisions(session=session)
+            for decision_attempt in range(2):
+                info = self.task_instance_scheduling_decisions(session=session)
 
-            tis = info.tis
-            schedulable_tis = info.schedulable_tis
-            changed_tis = info.changed_tis
-            finished_tis = info.finished_tis
-            unfinished = _UnfinishedStates.calculate(info.unfinished_tis)
+                tis = info.tis
+                schedulable_tis = info.schedulable_tis
+                changed_tis = info.changed_tis
+                finished_tis = info.finished_tis
+                unfinished = _UnfinishedStates.calculate(info.unfinished_tis)
 
-            if unfinished.should_schedule:
+                if not unfinished.should_schedule:
+                    break
                 are_runnable_tasks = schedulable_tis or changed_tis
                 # small speed up
                 if not are_runnable_tasks:
@@ -1265,6 +1267,19 @@ class DagRun(Base, LoggingMixin):
                     )
                     if changed_by_upstream:  # Something changed, we need to recalculate!
                         unfinished = unfinished.recalculate()
+                if are_runnable_tasks or decision_attempt:
+                    break
+                # Task instances committed concurrently with the decision above (e.g. a
+                # new mapped task instance) can make a live run look deadlocked. Failing
+                # it would permanently strand its remaining task instances, so confirm
+                # the verdict on fresh task states before the deadlock branch below.
+                self.log.info(
+                    "No runnable tasks in %s; re-evaluating on fresh task states before declaring a deadlock",
+                    self,
+                )
+                session.flush()
+                for ti in tis:
+                    session.expire(ti)
 
         tis_for_dagrun_state = self._tis_for_dagrun_state(dag=dag, tis=tis)
 
@@ -1332,7 +1347,11 @@ class DagRun(Base, LoggingMixin):
 
         # if *all tasks* are deadlocked, the run failed
         elif unfinished.should_schedule and not are_runnable_tasks:
-            self.log.error("Task deadlock (no runnable tasks); marking run %s failed", self)
+            self.log.error(
+                "Task deadlock (no runnable tasks); marking run %s failed. Blocked unfinished tasks: %s",
+                self,
+                [ti.task_id for ti in unfinished.tis],
+            )
             self.set_state(DagRunState.FAILED)
             self.notify_dagrun_state_changed(msg="all_tasks_deadlocked")
 

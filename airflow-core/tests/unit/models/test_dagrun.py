@@ -53,7 +53,7 @@ from airflow._shared.timezones import timezone
 from airflow.callbacks.callback_requests import DagCallbackRequest, DagRunContext
 from airflow.models.dag import DagModel, infer_automated_data_interval
 from airflow.models.dag_version import DagVersion
-from airflow.models.dagrun import DagRun, DagRunNote, clear_partition_runs
+from airflow.models.dagrun import DagRun, DagRunNote, TISchedulingDecision, clear_partition_runs
 from airflow.models.deadline import Deadline
 from airflow.models.deadline_alert import DeadlineAlert as DeadlineAlertModel
 from airflow.models.serialized_dag import SerializedDagModel
@@ -397,6 +397,96 @@ class TestDagRun:
         ti_op2.task.trigger_rule = "invalid"
         dr.update_state(session=session)
         assert dr.state == DagRunState.FAILED
+
+    def test_dagrun_deadlock_is_confirmed_on_fresh_state_before_failing(self, dag_maker, session):
+        """
+        A deadlock computed from a stale scheduling snapshot must be confirmed against
+        fresh task states before the run is terminally failed.
+        """
+        with dag_maker(schedule=datetime.timedelta(days=1), session=session):
+            op1 = EmptyOperator(task_id="A")
+            op2 = EmptyOperator(task_id="B")
+            op2.set_upstream(op1)
+
+        dr = dag_maker.create_dagrun()
+        dr.get_task_instance(task_id="A", session=session).set_state(
+            state=TaskInstanceState.SUCCESS, session=session
+        )
+
+        # Fresh decision: B is schedulable (A succeeded).
+        fresh_info = dr.task_instance_scheduling_decisions(session=session)
+        ti_b = next(ti for ti in fresh_info.tis if ti.task_id == "B")
+        # Stale snapshot taken before A's success became visible.
+        stale_info = TISchedulingDecision(
+            tis=[ti_b],
+            schedulable_tis=[],
+            changed_tis=False,
+            unfinished_tis=[ti_b],
+            finished_tis=[],
+        )
+
+        with (
+            mock.patch.object(
+                DagRun,
+                "task_instance_scheduling_decisions",
+                autospec=True,
+                side_effect=[stale_info, fresh_info],
+            ) as mock_decisions,
+            mock.patch.object(DagRun, "_are_premature_tis", autospec=True, return_value=(False, False)),
+        ):
+            dr.update_state(session=session)
+
+        assert mock_decisions.call_count == 2  # the would-be deadlock was re-checked
+        assert dr.state == DagRunState.RUNNING
+
+    def test_dagrun_no_false_deadlock_when_mapped_ti_is_committed_mid_evaluation(self, dag_maker, session):
+        """
+        Trigger rule evaluation counts a mapped upstream's task instances with a fresh
+        query while their states come from the earlier snapshot, so a mapped task
+        instance committed mid-evaluation (e.g. expansion from the mini scheduler) makes
+        the snapshot look deadlocked. The run must not be terminally failed: the new
+        task instance is schedulable.
+        """
+        with dag_maker(schedule=datetime.timedelta(days=1), session=session):
+            mapped = MockOperator.partial(task_id="A").expand(arg1=[1, 2, 3])
+            mapped >> EmptyOperator(task_id="B")
+
+        dr = dag_maker.create_dagrun()
+        # Expand the mapped task, then stage: two instances succeeded, the third not yet created.
+        dr.task_instance_scheduling_decisions(session=session)
+        for map_index in (0, 1):
+            dr.get_task_instance(task_id="A", map_index=map_index, session=session).set_state(
+                state=TaskInstanceState.SUCCESS, session=session
+            )
+        ti_a2 = dr.get_task_instance(task_id="A", map_index=2, session=session)
+        dag_version_id = ti_a2.dag_version_id
+        session.delete(ti_a2)
+        session.commit()
+
+        def _commit_third_mapped_ti():
+            other_session = settings.NonScopedSession()
+            ti = TI(task=dr.dag.get_task("A"), run_id=dr.run_id, map_index=2, dag_version_id=dag_version_id)
+            other_session.add(ti)
+            other_session.commit()
+            other_session.close()
+
+        real_get_ready_tis = DagRun._get_ready_tis
+        injected = False
+
+        def _concurrent_expansion(dr_self, schedulable_tis, finished_tis, session):
+            # The commit lands between the snapshot and the dependency evaluation.
+            nonlocal injected
+            if not injected:
+                injected = True
+                _commit_third_mapped_ti()
+            return real_get_ready_tis(dr_self, schedulable_tis, finished_tis, session=session)
+
+        with mock.patch.object(DagRun, "_get_ready_tis", autospec=True, side_effect=_concurrent_expansion):
+            schedulable_tis, _ = dr.update_state(session=session)
+
+        assert injected
+        assert dr.state == DagRunState.RUNNING
+        assert [(ti.task_id, ti.map_index) for ti in schedulable_tis] == [("A", 2)]
 
     def test_dagrun_no_deadlock_with_restarting(self, dag_maker, session):
         with dag_maker(schedule=datetime.timedelta(days=1)):
